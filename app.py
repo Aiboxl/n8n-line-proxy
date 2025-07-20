@@ -1,47 +1,75 @@
 import os
 import requests
-from flask import Flask, request, abort
+from flask import Flask, request, redirect, jsonify
+from urllib.parse import urlencode
 
-# 初始化 Flask 應用程式
 app = Flask(__name__)
 
-# 從環境變數中讀取我們在 Render 平台上設定好的秘密資訊
-N8N_WEBHOOK_URL = os.environ.get('N8N_WEBHOOK_URL')
-DEFAULT_GOOGLE_CLIENT_ID = os.environ.get('DEFAULT_GOOGLE_CLIENT_ID')
+# 從環境變數讀取 n8n 的 Webhook URL
+# 如果您在 Render 上設定了 N8N_WEBHOOK_URL，它會自動讀取
+N8N_WEBHOOK_URL = os.environ.get("N8N_WEBHOOK_URL", "")
 
-# 建立一個 Webhook 端點，路徑為 /callback
-# Line 官方伺服器未來會將所有訊息都送到這裡
-@app.route("/callback", methods=['POST'])
-def callback():
-    # 取得 Line 傳來的原始 JSON 資料
-    body_from_line = request.json
+# 從環境變數讀取 Google OAuth 的基本設定
+# 如果您在 Render 上設定了這些變數，它會自動讀取
+GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID", "")
+GOOGLE_REDIRECT_URI = os.environ.get("GOOGLE_REDIRECT_URI", "")
+GOOGLE_SCOPES = "https://www.googleapis.com/auth/userinfo.email https://www.googleapis.com/auth/userinfo.profile https://www.googleapis.com/auth/calendar.readonly"
 
-    # 建立一個 custom_data 物件，並填入我們的 Google Client ID
-    custom_data = {
-        "google_client_id": DEFAULT_GOOGLE_CLIENT_ID
+@app.route('/webhook_proxy', methods=['POST'])
+def webhook_proxy():
+    if not N8N_WEBHOOK_URL:
+        return jsonify({"error": "N8N_WEBHOOK_URL is not configured"}), 500
+
+    data = request.get_json()
+    
+    # 將固定的 Google Client ID 加入到 custom_data 中
+    data['custom_data'] = {
+        'google_client_id': GOOGLE_CLIENT_ID
     }
 
-    # 將這個 custom_data 物件，加入到從 Line 傳來的資料中
-    body_from_line['custom_data'] = custom_data
-
     try:
-        # 將我們 "加工" 過後的資料，轉發給 n8n
-        requests.post(
-            N8N_WEBHOOK_URL,
-            json=body_from_line,
-            headers={'Content-Type': 'application/json'},
-            timeout=5 # 設定5秒超時
-        )
+        response = requests.post(N8N_WEBHOOK_URL, json=data, timeout=10)
+        # 僅當中繼成功時回傳 200 OK
+        if response.status_code >= 200 and response.status_code < 300:
+            return jsonify({"status": "ok"}), 200
+        else:
+            # 如果 n8n 回傳錯誤，也將其視為一個錯誤
+            return jsonify({"error": "Failed to forward to n8n", "n8n_status": response.status_code}), 502
     except requests.exceptions.RequestException as e:
-        # 如果轉發失敗，在 Render 的後台日誌中印出錯誤
-        print(f"Error forwarding request to n8n: {e}")
-        # 中斷請求並回應一個伺服器錯誤
-        abort(500)
+        return jsonify({"error": str(e)}), 500
 
-    # 回應一個 'OK' 給 Line 官方伺服器，表示我們已成功收到訊息
-    return 'OK'
+@app.route('/redirect_to_google', methods=['GET'])
+def redirect_to_google():
+    user_id = request.args.get('user_id')
+    if not user_id:
+        return "Error: User ID is missing.", 400
+    
+    if not all([GOOGLE_CLIENT_ID, GOOGLE_REDIRECT_URI]):
+        return "Error: Google OAuth environment variables are not configured.", 500
 
-# 這段是為了讓 gunicorn (Render 的應用程式伺服器) 能找到 'app' 物件
-if __name__ == "__main__":
-    # 這行程式碼主要是在本地開發測試時使用
-    app.run()
+    # 將 line_user_id 和 client_id 一起打包到 state 參數中
+    # 注意：我們不再傳遞 client_id，因為後端可以從環境變數中讀取
+    state_value = f"user_id={user_id}"
+
+    params = {
+        'client_id': GOOGLE_CLIENT_ID,
+        'redirect_uri': GOOGLE_REDIRECT_URI,
+        'scope': GOOGLE_SCOPES,
+        'response_type': 'code',
+        'access_type': 'offline',
+        'prompt': 'consent',
+        'state': state_value
+    }
+    
+    google_auth_url = 'https://accounts.google.com/o/oauth2/v2/auth?' + urlencode(params)
+    
+    return redirect(google_auth_url)
+
+# 健康檢查端點，用於確認服務是否存活
+@app.route('/')
+def index():
+    return jsonify({"status": "ok", "message": "Proxy is running"}), 200
+
+if __name__ == '__main__':
+    # 使用 Gunicorn 時，通常不會執行這一段
+    app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 8080)))
